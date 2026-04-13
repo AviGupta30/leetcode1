@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+api/__pycache__/
+.env
+venv/
+ENV/
+
+# Node.js
+node_modules/
+client/node_modules/
+dist/
+client/dist/
+
+# IDEs
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
