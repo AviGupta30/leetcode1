@@ -2,13 +2,12 @@ name: LeetCode Contest Sync
 
 on:
   schedule:
-    # Runs every Sunday at 10:30 AM UTC
     - cron: '30 10 * * 0'
-  workflow_dispatch: # Allows manual trigger via GitHub UI
+  workflow_dispatch:
 
 jobs:
   scrape_and_sync:
-    runs-on: ubuntu-latest
+    runs-on: macos-latest # This is the magic line that bypasses Cloudflare
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -26,4 +25,4 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-        run: python cloud_etl.py
+        run: python cloud_etl.py weekly-contest-497
