@@ -1,0 +1,30 @@
+name: LeetCode Contest Sync
+
+on:
+  schedule:
+    # This runs every Sunday at 10:30 AM UTC (adjust for contest end time)
+    - cron: '30 10 * * 0'
+  workflow_dispatch: # Allows you to run it manually with a button
+
+jobs:
+  scrape_and_sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: |
+          pip install supabase curl_cffi
+
+      - name: Run ETL Script
+        env:
+          # We store your secret keys in GitHub Settings, not the code!
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: python cloud_etl.py

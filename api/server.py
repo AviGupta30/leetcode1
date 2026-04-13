@@ -1,45 +1,39 @@
 """
-server.py — FastAPI Backend V4 (Hybrid Rating Engine)
-======================================================
-Rating resolution pipeline (in priority order):
-
-  1. LOCAL CACHE  — ratings_cache.json on disk. Grows after every contest.
-                    Treats CN + Global users equally once they are seen once.
-  2. GRAPHQL LIVE — LeetCode .com GraphQL for users not yet cached.
-                    Resolves Global (US/EU/...) users accurately.
-                    Falls through silently for CN users (returns null).
-  3. RANK-ESTIMATOR — For users GraphQL cannot resolve (mainly CN Grandmasters).
-                      Uses calibrated empirical LeetCode rating percentiles.
-                      Far superior to a flat 1500 default.
-
-After every contest scrape a background task runs to batch-fetch GraphQL
-ratings for all participants and persist them to ratings_cache.json.
-Over time the cache warms up and the estimator is used less and less.
-
-Endpoints:
-  GET  /api/contests
-  GET  /api/leaderboard/{slug}?page&per_page&search
-  GET  /api/leaderboard/{slug}/status
-  POST /api/predict
+server.py — FastAPI Backend V5.2 (Production Pipeline)
+=======================================================
+V5.2 Changes (mathematical parity):
+  1. REMOVED _static_estimator — no more "1450 Ghosting".
+     Missing users get 1500.0 neutral placeholder; /api/predict ALWAYS
+     performs a blocking GraphQL fetch for the queried user.
+  2. Flexible /api/predict search (Req 1):
+       Step 1 → case-insensitive handle match in live leaderboard
+       Step 2 → Supabase leaderboards table (username + display_name ILIKE)
+       Step 3 → GraphQL handle resolution as final fallback
+  3. Background healer still warms the SQLite cache at 1 req/s after load.
 """
 
 import asyncio
-import json
 import math
 import os
 import time
 from collections import defaultdict
 from typing import Dict, Any, Optional
 
+import aiosqlite
 import requests
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from supabase import create_client, Client as SupabaseClient
 
 from fast_scraper import fetch_leaderboard
 from rating_math import predict, predict_all_users
 
-app = FastAPI(title="LeetCode Predictor API V4 — Hybrid")
+# ─────────────────────────────────────────────────────────────────────────────
+# APP & MIDDLEWARE
+# ─────────────────────────────────────────────────────────────────────────────
+
+app = FastAPI(title="LeetCode Predictor API V5.2")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -48,128 +42,46 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-_DEFAULT_RATING       = 1500.0
-_DEFAULT_COUNT        = 10      # veteran default — avoids rookies monopolising dampening
-_GRAPHQL_URL          = "https://leetcode.com/graphql/"
-_GRAPHQL_HEADERS      = {
+# ─────────────────────────────────────────────────────────────────────────────
+# CONFIG
+# ─────────────────────────────────────────────────────────────────────────────
+
+_DB_FILE       = "leetcode_cache.db"
+_GRAPHQL_URL   = "https://leetcode.com/graphql/"
+_GRAPHQL_HEADERS = {
     "Content-Type": "application/json",
     "Referer":      "https://leetcode.com/contest/",
-    "User-Agent":   (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
+    "User-Agent":   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36",
 }
-_CACHE_FILE = os.path.join(os.path.dirname(__file__), "ratings_cache.json")
-# How many GraphQL calls to run concurrently when warming the cache
-_GRAPHQL_CONCURRENCY = 20
 
-# ---------------------------------------------------------------------------
-# Rank-percentile → Rating Estimator
-# ---------------------------------------------------------------------------
-# Used ONLY for the fraction of users that the local cache + GraphQL cannot
-# resolve (primarily LeetCode CN Grandmasters whose profiles are opaque to
-# the .com GraphQL endpoint).
-#
-# Calibrated from empirical LeetCode active-participant distributions:
-_RATING_PERCENTILE = [
-    (0.0005, 3500.0),  # top 0.05%  — 1-3 users in a 25k contest
-    (0.001,  3200.0),
-    (0.003,  2900.0),
-    (0.007,  2700.0),
-    (0.015,  2500.0),
-    (0.030,  2300.0),
-    (0.055,  2100.0),
-    (0.090,  2000.0),
-    (0.130,  1900.0),
-    (0.180,  1850.0),
-    (0.230,  1800.0),
-    (0.290,  1750.0),
-    (0.360,  1700.0),
-    (0.440,  1650.0),
-    (0.520,  1600.0),
-    (0.600,  1550.0),
-    (0.680,  1500.0),
-    (0.760,  1450.0),
-    (0.840,  1400.0),
-    (0.910,  1350.0),
-    (0.960,  1300.0),
-    (0.990,  1250.0),
-    (1.000,  1200.0),
-]
+# Supabase — prefer environment variables (GitHub Secrets)
+_SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://iyrxbuarsuvsehrwemij.supabase.co")
+_SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "sb_publishable_ZecAAYAgX256SgF_fvUcAw_ZghR1EeM")
+supabase: SupabaseClient = create_client(_SUPABASE_URL, _SUPABASE_KEY)
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. SQLite WAL-MODE CACHE INIT
+# ─────────────────────────────────────────────────────────────────────────────
 
-def _estimate_rating_from_rank(rank: float, total: int) -> float:
-    """Map a contest rank to an estimated pre-contest rating via linear
-    interpolation over the empirical LeetCode active-user distribution."""
-    if total <= 0:
-        return _DEFAULT_RATING
-    pct = float(rank) / float(total)
-    table = _RATING_PERCENTILE
-    for i in range(1, len(table)):
-        p_hi, r_hi = table[i]
-        p_lo, r_lo = table[i - 1]
-        if pct <= p_hi:
-            t = (pct - p_lo) / (p_hi - p_lo + 1e-12)
-            return r_lo + t * (r_hi - r_lo)
-    return table[-1][1]
+@app.on_event("startup")
+async def startup_db():
+    async with aiosqlite.connect(_DB_FILE) as db:
+        await db.execute("PRAGMA journal_mode=WAL;")
+        await db.execute("PRAGMA synchronous=NORMAL;")
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                username       TEXT PRIMARY KEY,
+                rating         REAL,
+                contest_count  INTEGER,
+                last_updated   REAL
+            )
+        """)
+        await db.commit()
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 2. GRAPHQL HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
 
-# ---------------------------------------------------------------------------
-# Local ratings cache  (ratings_cache.json)
-# ---------------------------------------------------------------------------
-# Schema: { "username": {"rating": float, "count": int, "ts": float}, ... }
-_ratings_cache: Dict[str, dict] = {}
-
-
-def _load_cache() -> None:
-    """Load ratings_cache.json from disk into memory at startup."""
-    global _ratings_cache
-    if os.path.exists(_CACHE_FILE):
-        try:
-            with open(_CACHE_FILE, "r", encoding="utf-8") as f:
-                _ratings_cache = json.load(f)
-            print(f"[cache] Loaded {len(_ratings_cache):,} cached user ratings from disk.", flush=True)
-        except Exception as e:
-            print(f"[cache] WARNING: Could not load cache ({e}). Starting fresh.", flush=True)
-            _ratings_cache = {}
-    else:
-        print("[cache] No ratings_cache.json found — starting with empty cache.", flush=True)
-
-
-def _save_cache() -> None:
-    """Persist the in-memory cache to disk."""
-    try:
-        with open(_CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(_ratings_cache, f, separators=(",", ":"))
-        print(f"[cache] Saved {len(_ratings_cache):,} user ratings to disk.", flush=True)
-    except Exception as e:
-        print(f"[cache] WARNING: Could not save cache ({e}).", flush=True)
-
-
-# Load on import (runs when uvicorn starts the module)
-_load_cache()
-
-# ---------------------------------------------------------------------------
-# Global state: contest cache + scrape locks
-# ---------------------------------------------------------------------------
-contest_cache: Dict[str, Dict[str, Any]] = {}
-contest_scrape_locks: Dict[str, asyncio.Lock] = {}
-contest_scrape_status: Dict[str, str] = {}  # "scraping" | "done" | "error"
-
-
-def _get_lock(slug: str) -> asyncio.Lock:
-    if slug not in contest_scrape_locks:
-        contest_scrape_locks[slug] = asyncio.Lock()
-    return contest_scrape_locks[slug]
-
-
-# ---------------------------------------------------------------------------
-# GraphQL helpers
-# ---------------------------------------------------------------------------
 _GQL_USER_RANKING = """
 query userContestRankingInfo($username: String!) {
     userContestRanking(username: $username) {
@@ -188,165 +100,218 @@ query pastContests($pageNo: Int, $numPerPage: Int) {
 """
 
 
-def _gql(query: str, variables: dict = None) -> dict:
-    """Synchronous GraphQL call, returns the data dict."""
-    payload = {"query": query}
-    if variables:
-        payload["variables"] = variables
+def _gql_user_data(username: str) -> tuple[Optional[float], Optional[int]]:
+    """
+    Blocking GraphQL fetch for a user's current rating and contest count.
+    Returns (None, None) if the user doesn't exist or the request fails.
+    This is intentionally synchronous — accuracy > latency for /api/predict.
+    """
     try:
         resp = requests.post(
             _GRAPHQL_URL,
-            json=payload,
+            json={"query": _GQL_USER_RANKING, "variables": {"username": username}},
             headers=_GRAPHQL_HEADERS,
-            timeout=10,
+            timeout=8,
         )
-        return resp.json().get("data") or {}
-    except Exception:
-        return {}
-
-
-def _gql_user_data(username: str) -> tuple[Optional[float], Optional[int]]:
-    """
-    Fetch (rating, count) from LeetCode GraphQL.
-    Returns (None, None) for CN users or network errors.
-    """
-    data = _gql(_GQL_USER_RANKING, {"username": username})
-    ranking = data.get("userContestRanking") or {}
-    rating = ranking.get("rating")
-    count = ranking.get("attendedContestsCount")
-    if rating is not None:
-        return float(rating), int(count or 0)
+        ranking = resp.json().get("data", {}).get("userContestRanking") or {}
+        if ranking.get("rating") is not None:
+            return float(ranking["rating"]), int(ranking.get("attendedContestsCount") or 0)
+    except Exception as exc:
+        print(f"[gql] Failed for '{username}': {exc}", flush=True)
     return None, None
 
 
-# ---------------------------------------------------------------------------
-# Build enriched dict — Hybrid pipeline
-# ---------------------------------------------------------------------------
-def _build_enriched(leaderboard: Dict[str, dict]) -> tuple:
-    """
-    Build (rating_counts, enriched) from the live leaderboard using the
-    3-tier hybrid pipeline:
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. ASYNC HELPERS (Supabase resolve + SQLite cache write)
+# ─────────────────────────────────────────────────────────────────────────────
 
-      Tier 1 — Local cache hit  (instant, covers previously seen users)
-      Tier 2 — GraphQL resolve  (covers new global/US users in real-time)
-      Tier 3 — Rank-percentile estimator  (CN users; no circular logic:
-               we use their raw contest rank as reported by LeetCode's own
-               server, not anything derived from our math engine)
+async def _resolve_via_supabase(
+    search_term: str,
+    contest_slug: str,
+    lower_map: Dict[str, str],
+) -> Optional[str]:
+    """
+    Query Supabase `leaderboards` table for a matching row in this contest.
+    Checks `username` (handle) first, then `display_name` — both case-insensitive.
+    Returns the canonical key present in the live in-memory leaderboard, or None.
+    """
+    loop = asyncio.get_event_loop()
+
+    def _query() -> Optional[str]:
+        # ── Pass 1: match by handle ──────────────────────────────────────────
+        res = (
+            supabase.table("leaderboards")
+            .select("username")
+            .eq("contest_slug", contest_slug)
+            .ilike("username", search_term)
+            .limit(1)
+            .execute()
+        )
+        if res.data:
+            return res.data[0]["username"]
+
+        # ── Pass 2: match by display_name ────────────────────────────────────
+        try:
+            res2 = (
+                supabase.table("leaderboards")
+                .select("username")
+                .eq("contest_slug", contest_slug)
+                .ilike("display_name", search_term)
+                .limit(1)
+                .execute()
+            )
+            if res2.data:
+                return res2.data[0]["username"]
+        except Exception:
+            pass   # display_name column may not exist in older schema versions
+
+        return None
+
+    try:
+        db_username = await loop.run_in_executor(None, _query)
+        if db_username:
+            # Map the resolved handle back into the live leaderboard
+            return lower_map.get(db_username.lower()) or lower_map.get(db_username)
+    except Exception as exc:
+        print(f"[predict] Supabase resolve error: {exc}", flush=True)
+
+    return None
+
+
+async def _cache_user(username: str, rating: float, count: int) -> None:
+    """Write a freshly-fetched rating into the local SQLite cache."""
+    async with aiosqlite.connect(_DB_FILE) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO users (username, rating, contest_count, last_updated) "
+            "VALUES (?, ?, ?, ?)",
+            (username, rating, count, time.time()),
+        )
+        await db.commit()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. DATA-JOIN PIPELINE  (_build_enriched)
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _build_enriched(leaderboard: Dict[str, dict]) -> tuple:
+    """
+    Join every leaderboard entry with its historical rating from SQLite.
+
+    V5.2: _static_estimator REMOVED.
+    Missing / stale users receive a neutral 1500.0 placeholder so the
+    rating_counts distribution is never poisoned by rank-guessed values.
+    The background healer (Section 5) will replace placeholders within minutes
+    at 1 GraphQL req/s, so subsequent calls will be accurate.
     """
     rating_counts: Dict[int, float] = defaultdict(float)
     enriched: Dict[str, dict] = {}
+    usernames = list(leaderboard.keys())
 
-    total = len(leaderboard)
-    tier_hits = [0, 0, 0]  # cache, graphql, estimator
+    # ── 1. Bulk SQLite lookup ────────────────────────────────────────────────
+    cached_data: Dict[str, dict] = {}
+    async with aiosqlite.connect(_DB_FILE) as db:
+        chunk_size = 900
+        for i in range(0, len(usernames), chunk_size):
+            chunk = usernames[i : i + chunk_size]
+            placeholders = ",".join(["?"] * len(chunk))
+            async with db.execute(
+                f"SELECT username, rating, contest_count, last_updated "
+                f"FROM users WHERE username IN ({placeholders})",
+                chunk,
+            ) as cursor:
+                async for row in cursor:
+                    cached_data[row[0]] = {
+                        "rating": row[1],
+                        "count":  row[2],
+                        "ts":     row[3],
+                    }
+
+    # ── 2. Build enriched dict ───────────────────────────────────────────────
+    missing_or_stale: list[str] = []
+    current_time = time.time()
+    _STALE_SECONDS = 6 * 24 * 3600  # 6 days
 
     for username, data in leaderboard.items():
-        old_rating: Optional[float] = None
-        contest_count: int = _DEFAULT_COUNT
+        cached   = cached_data.get(username)
+        is_stale = cached is None or (current_time - cached["ts"]) > _STALE_SECONDS
 
-        # ── Tier 1: local cache ─────────────────────────────────────────────
-        cached = _ratings_cache.get(username)
-        if cached:
-            old_rating = float(cached["rating"])
-            contest_count = int(cached.get("count", _DEFAULT_COUNT))
-            tier_hits[0] += 1
-
-        # ── Tier 2: GraphQL live resolve ────────────────────────────────────
-        if old_rating is None:
-            gql_rating, gql_count = _gql_user_data(username)
-            if gql_rating is not None:
-                old_rating = gql_rating
-                contest_count = gql_count
-                # Write-through to cache
-                _ratings_cache[username] = {
-                    "rating": old_rating,
-                    "count":  contest_count,
-                    "ts":     time.time(),
-                }
-                tier_hits[1] += 1
-
-        # ── Tier 3: rank-percentile estimator ──────────────────────────────
-        if old_rating is None:
-            old_rating = _estimate_rating_from_rank(data["actual_rank"], total)
-            contest_count = _DEFAULT_COUNT  # treat as seasoned player
-            tier_hits[2] += 1
+        if is_stale:
+            # V5.2: neutral placeholder — NOT a rank-based guess
+            old_rating    = 1500.0
+            contest_count = 0
+            missing_or_stale.append(username)
+        else:
+            old_rating    = cached["rating"]
+            contest_count = cached["count"]
 
         rating_counts[round(old_rating)] += 1.0
         enriched[username] = {
-            "actual_rank":          data["actual_rank"],
-            "score":                data["score"],
-            "finish_time_seconds":  data.get("finish_time_seconds", 0),
-            "old_rating":           old_rating,
-            "contest_count":        contest_count,
+            "actual_rank":         data["actual_rank"],
+            "score":               data["score"],
+            "finish_time_seconds": data.get("finish_time_seconds", 0),
+            "old_rating":          old_rating,
+            "contest_count":       contest_count,
         }
 
-    # ── Contamination telemetry ─────────────────────────────────────────────
-    c, g, e = tier_hits
     print(
-        f"[server] Pool: {total:,} | "
-        f"Cache: {c:,} ({100*c//max(1,total)}%) | "
-        f"GraphQL: {g:,} ({100*g//max(1,total)}%) | "
-        f"Estimated: {e:,} ({100*e//max(1,total)}%)",
+        f"[server] DB hits: {len(cached_data):,} | "
+        f"Missing/stale: {len(missing_or_stale):,} (placeholders @ 1500)",
         flush=True,
     )
+    return dict(rating_counts), enriched, missing_or_stale
 
-    return dict(rating_counts), enriched
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. BACKGROUND HEALER  (throttled GraphQL drip — fills the SQLite cache)
+# ─────────────────────────────────────────────────────────────────────────────
 
-# ---------------------------------------------------------------------------
-# Background cache-warmer: batch-fetches GraphQL for all contest participants
-# ---------------------------------------------------------------------------
-async def _warm_cache_background(usernames: list[str]) -> None:
-    """
-    After a contest is fully scraped, fetch GraphQL ratings in background
-    for any user not already in the cache. Runs concurrently, respects a
-    semaphore to avoid hammering LeetCode's API.
-    """
-    missing = [u for u in usernames if u not in _ratings_cache]
-    if not missing:
+async def _warm_cache_background(missing_users: list[str]) -> None:
+    if not missing_users:
         return
+    print(f"[cache] Healer starting for {len(missing_users):,} users...", flush=True)
 
-    print(f"[cache] Warming: fetching GraphQL ratings for {len(missing):,} new users...", flush=True)
-    sem = asyncio.Semaphore(_GRAPHQL_CONCURRENCY)
-    resolved = 0
-
-    async def _fetch_one(username: str) -> None:
-        nonlocal resolved
-        async with sem:
-            # Run the sync GraphQL call in a thread pool to avoid blocking the loop
-            loop = asyncio.get_event_loop()
+    async with aiosqlite.connect(_DB_FILE) as db:
+        loop = asyncio.get_event_loop()
+        for username in missing_users:
             rating, count = await loop.run_in_executor(None, _gql_user_data, username)
             if rating is not None:
-                _ratings_cache[username] = {
-                    "rating": rating,
-                    "count":  count,
-                    "ts":     time.time(),
-                }
-                resolved += 1
+                await db.execute(
+                    "INSERT OR REPLACE INTO users (username, rating, contest_count, last_updated) "
+                    "VALUES (?, ?, ?, ?)",
+                    (username, rating, count, time.time()),
+                )
+                await db.commit()
+            # 1 req/s WAF protection
+            await asyncio.sleep(1.0)
 
-    await asyncio.gather(*[_fetch_one(u) for u in missing])
-    print(f"[cache] Warm-up done: {resolved:,}/{len(missing):,} new users cached.", flush=True)
-    _save_cache()
+    print("[cache] Healer finished.", flush=True)
 
 
-# ---------------------------------------------------------------------------
-# Core: ensure contest is scraped and all predictions computed
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# 6. CONTEST CACHE & SCRAPE ORCHESTRATION
+# ─────────────────────────────────────────────────────────────────────────────
+
+contest_cache:         Dict[str, Dict[str, Any]] = {}
+contest_scrape_locks:  Dict[str, asyncio.Lock]   = {}
+contest_scrape_status: Dict[str, str]             = {}
+
+
+def _get_lock(slug: str) -> asyncio.Lock:
+    if slug not in contest_scrape_locks:
+        contest_scrape_locks[slug] = asyncio.Lock()
+    return contest_scrape_locks[slug]
+
+
 async def _ensure_contest_data(slug: str) -> Dict[str, Any]:
-    """
-    Returns cached data, running the scrape + mass-prediction if not done.
-    The asyncio.Lock guarantees only ONE scrape per slug runs at a time.
-    """
     if slug in contest_cache:
         return contest_cache[slug]
 
-    lock = _get_lock(slug)
-    async with lock:
+    async with _get_lock(slug):
         if slug in contest_cache:
             return contest_cache[slug]
 
         contest_scrape_status[slug] = "scraping"
         print(f"[server] Scraping '{slug}'...", flush=True)
-        t0 = time.perf_counter()
 
         try:
             leaderboard = await fetch_leaderboard(slug)
@@ -354,151 +319,177 @@ async def _ensure_contest_data(slug: str) -> Dict[str, Any]:
             contest_scrape_status[slug] = "error"
             raise HTTPException(status_code=404, detail=str(exc))
 
-        if not leaderboard:
-            contest_scrape_status[slug] = "error"
-            raise HTTPException(
-                status_code=404,
-                detail=f"No active participants found for '{slug}'.",
-            )
-
-        rating_counts, enriched = _build_enriched(leaderboard)
-
-        print(f"[server] Predicting for {len(enriched):,} users...", flush=True)
+        rating_counts, enriched, missing_users = await _build_enriched(leaderboard)
         rows = predict_all_users(enriched, rating_counts)
-
-        elapsed = time.perf_counter() - t0
-        print(
-            f"[server] '{slug}' done in {elapsed:.1f}s. {len(rows):,} rows ready.",
-            flush=True,
-        )
 
         contest_cache[slug] = {
             "rows":          rows,
             "total":         len(rows),
-            "scraped_at":    time.time(),
             "rating_counts": rating_counts,
             "enriched":      enriched,
         }
         contest_scrape_status[slug] = "done"
 
-        # Fire-and-forget background cache warmer
-        asyncio.create_task(_warm_cache_background(list(leaderboard.keys())))
+        # Fire background healer to replace 1500 placeholders
+        asyncio.create_task(_warm_cache_background(missing_users))
 
     return contest_cache[slug]
 
 
-# ---------------------------------------------------------------------------
-# GET /api/contests
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# 7. ENDPOINTS
+# ─────────────────────────────────────────────────────────────────────────────
+
 @app.get("/api/contests")
 async def get_contests():
-    """Return the 10 most recent LeetCode contests via GraphQL."""
-    data = _gql(_GQL_PAST_CONTESTS, {"pageNo": 1, "numPerPage": 10})
-    contests = data.get("pastContests", {}).get("data", [])
-    if not contests:
-        raise HTTPException(status_code=502, detail="Could not fetch contest list from LeetCode.")
-    return [
-        {"title": c["title"], "slug": c["titleSlug"], "start_time": c.get("startTime")}
-        for c in contests
-    ]
+    payload = {
+        "query":     _GQL_PAST_CONTESTS,
+        "variables": {"pageNo": 1, "numPerPage": 10},
+    }
+    try:
+        resp = requests.post(_GRAPHQL_URL, json=payload, headers=_GRAPHQL_HEADERS, timeout=5)
+        contests = resp.json().get("data", {}).get("pastContests", {}).get("data", [])
+        return [{"title": c["title"], "slug": c["titleSlug"]} for c in contests]
+    except Exception:
+        raise HTTPException(status_code=502, detail="Failed to fetch contests from GraphQL.")
 
 
-# ---------------------------------------------------------------------------
-# GET /api/leaderboard/{slug}/status
-# ---------------------------------------------------------------------------
-@app.get("/api/leaderboard/{slug}/status")
-async def leaderboard_status(slug: str):
-    if slug in contest_cache:
-        return {"status": "done", "total": contest_cache[slug]["total"]}
-    return {"status": contest_scrape_status.get(slug, "not_started"), "total": 0}
-
-
-# ---------------------------------------------------------------------------
-# GET /api/leaderboard/{slug}
-# ---------------------------------------------------------------------------
 @app.get("/api/leaderboard/{slug}")
 async def get_leaderboard(
-    slug: str,
-    page: int = Query(1, ge=1),
-    per_page: int = Query(50, ge=1, le=200),
-    search: Optional[str] = Query(None),
+    slug:     str,
+    page:     int           = Query(1, ge=1),
+    per_page: int           = Query(50),
+    search:   Optional[str] = None,
 ):
-    """
-    Paginated, searchable full leaderboard with all predicted ratings.
-    First request scrapes (~45–120s on rate-limited contests).
-    All subsequent requests are instant from cache.
-    """
     data = await _ensure_contest_data(slug)
     rows = data["rows"]
 
-    if search and search.strip():
+    if search:
         term = search.strip().lower()
         rows = [r for r in rows if term in r["username"].lower()]
 
-    total_filtered = len(rows)
     start = (page - 1) * per_page
-    page_rows = rows[start: start + per_page]
-
     return {
         "slug":        slug,
-        "total":       total_filtered,
+        "total":       len(rows),
         "page":        page,
         "per_page":    per_page,
-        "total_pages": max(1, (total_filtered + per_page - 1) // per_page),
-        "rows":        page_rows,
+        "total_pages": max(1, (len(rows) + per_page - 1) // per_page),
+        "rows":        rows[start : start + per_page],
     }
 
 
-# ---------------------------------------------------------------------------
-# POST /api/predict  — single-user, exact prediction
-# ---------------------------------------------------------------------------
+# ─── /api/predict ─────────────────────────────────────────────────────────────
+
 class PredictRequest(BaseModel):
-    username: str
+    username:     str
     contest_slug: str
 
 
 @app.post("/api/predict")
 async def predict_user(req: PredictRequest):
     """
-    Single-user exact prediction.
-    Fetches the user's live (rating, count) from GraphQL, overriding
-    any cached/estimated value to guarantee the most accurate result.
-    """
-    data = await _ensure_contest_data(req.contest_slug)
-    enriched = data["enriched"]
-    rating_counts = data["rating_counts"]
+    Predict rating delta for a single user.
 
-    lower_map = {k.lower(): k for k in enriched}
-    canonical = lower_map.get(req.username.lower())
+    Req 1 — Flexible Search (3-step resolution):
+      Step 1: Case-insensitive handle match in the live in-memory leaderboard.
+      Step 2: Supabase leaderboards table — checks `username` ILIKE and
+              `display_name` ILIKE so display names resolve to real handles.
+      Step 3: GraphQL — confirms the term is a valid LeetCode handle and
+              looks them up in the contest data.
+
+    Req 4 — No more 1450 Ghosting:
+      Always performs a blocking GraphQL fetch for the specific queried user
+      before calculating, guaranteeing we use their true rating & contest count.
+      If GraphQL is unreachable we fall back to the SQLite-cached value.
+      Accuracy > latency.
+    """
+    data     = await _ensure_contest_data(req.contest_slug)
+    enriched = data["enriched"]
+    search   = req.username.strip()
+
+    # Build a lowercase → canonical-key map from the live leaderboard
+    lower_map: Dict[str, str] = {k.lower(): k for k in enriched}
+
+    # ── Step 1: Direct case-insensitive handle match ──────────────────────────
+    canonical: Optional[str] = lower_map.get(search.lower())
+
+    # ── Step 2: Supabase display_name / username lookup (case-insensitive) ────
+    if not canonical:
+        canonical = await _resolve_via_supabase(search, req.contest_slug, lower_map)
+        if canonical:
+            print(f"[predict] Resolved '{search}' → '{canonical}' via Supabase.", flush=True)
+
+    # ── Step 3: GraphQL handle resolution as last resort ─────────────────────
+    if not canonical:
+        # Attempt the search term as if it were a LeetCode handle
+        gql_rating, _ = _gql_user_data(search)
+        if gql_rating is not None:
+            # Handle is valid on LeetCode — check if they participated
+            canonical = lower_map.get(search.lower())
+            if not canonical:
+                raise HTTPException(
+                    status_code=404,
+                    detail=(
+                        f"User '{search}' exists on LeetCode but did not participate "
+                        f"in '{req.contest_slug}'."
+                    ),
+                )
+            print(f"[predict] Resolved '{search}' via GraphQL.", flush=True)
+
     if not canonical:
         raise HTTPException(
             status_code=404,
             detail=(
-                f"'{req.username}' is not on the leaderboard for '{req.contest_slug}'. "
-                "They may have scored 0 (ghost) or did not participate."
+                f"'{search}' was not found in contest '{req.contest_slug}'. "
+                "Check spelling or try your exact LeetCode handle."
             ),
         )
 
     entry = enriched[canonical]
 
-    # Live GraphQL pull — bypasses stale cache & Biweekly collision
-    live_rating, live_count = _gql_user_data(canonical)
-    true_old_rating  = live_rating if live_rating is not None else entry["old_rating"]
-    true_count       = live_count  if live_count  is not None else entry["contest_count"]
+    # ── Req 4: Blocking GraphQL fetch — accuracy over latency ─────────────────
+    # This is the single most important fix: always use the true rating,
+    # never the 1500 neutral placeholder for the target user.
+    loop = asyncio.get_event_loop()
+    live_rating, live_count = await loop.run_in_executor(None, _gql_user_data, canonical)
+
+    if live_rating is not None:
+        true_rating = live_rating
+        true_count  = live_count
+        # Persist for future leaderboard loads (don't await — fire and forget)
+        asyncio.create_task(_cache_user(canonical, live_rating, live_count))
+        print(
+            f"[predict] '{canonical}': live rating={live_rating:.0f}, "
+            f"contests={live_count}",
+            flush=True,
+        )
+    else:
+        # GraphQL unreachable — use whatever we have in the enriched entry.
+        # If the user had a real cached rating it will be correct; if they were
+        # a 1500 placeholder the prediction will carry some error but won't crash.
+        true_rating = entry["old_rating"]
+        true_count  = entry["contest_count"]
+        print(
+            f"[predict] WARNING: GraphQL unavailable for '{canonical}'. "
+            f"Falling back to cached rating {true_rating:.0f}.",
+            flush=True,
+        )
 
     result = predict(
-        old_rating=true_old_rating,
-        contest_count=true_count,
-        actual_rank=int(entry["actual_rank"]),
-        rating_counts=rating_counts,
+        true_rating,
+        true_count,
+        float(entry["actual_rank"]),
+        data["rating_counts"],
     )
-    result["username"]            = canonical
-    result["contest_count"]       = true_count
-    result["score"]               = entry["score"]
-    result["finish_time_seconds"] = entry.get("finish_time_seconds", 0)
+    result["username"] = canonical
     return result
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# ENTRY POINT
+# ─────────────────────────────────────────────────────────────────────────────
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("server:app", host="0.0.0.0", port=8000, reload=False)
+    uvicorn.run("server:app", host="0.0.0.0", port=8080, reload=False)
