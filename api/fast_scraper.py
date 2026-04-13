@@ -113,9 +113,14 @@ async def fetch_leaderboard(contest_slug: str) -> Dict[str, dict]:
             if data is None:
                 failed += 1
                 continue
-            for row in data.get("total_rank", []):
+            users = data.get("total_rank", [])
+            subs = data.get("submissions", [])
+            
+            for row, sub in zip(users, subs):
                 score = int(row.get("score", 0))
-                if score <= 0:
+                # Ghost user rules: score <= 0 AND zero code submissions. 
+                # If they submitted wrong answers, `sub` is populated, so they are kept!
+                if score <= 0 and not sub:
                     continue
                 username = row.get("username", "").strip()
                 if not username:

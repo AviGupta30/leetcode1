@@ -105,11 +105,18 @@ def _gql(query: str, variables: dict = None) -> dict:
         return {}
 
 
-def _get_user_contest_count(username: str) -> int:
-    """Fetch a user's attended contest count from LeetCode GraphQL."""
+def _get_live_user_data(username: str) -> tuple[int, Optional[float]]:
+    """Fetch a user's live attended contest count and rating from LeetCode GraphQL.
+    This resolves Trap 1 (Stale Data/Biweekly) and Trap 3 (China Sync) natively."""
     data = _gql(_GQL_USER_RANKING, {"username": username})
     ranking = data.get("userContestRanking") or {}
-    return int(ranking.get("attendedContestsCount") or 0)
+    
+    count = int(ranking.get("attendedContestsCount") or 0)
+    rating = ranking.get("rating")
+    
+    if rating is not None:
+        return count, float(rating)
+    return count, None
 
 
 # ---------------------------------------------------------------------------
@@ -295,11 +302,15 @@ async def predict_user(req: PredictRequest):
 
     entry = enriched[canonical]
 
-    # Fetch real contest count from LeetCode for maximum accuracy
-    real_count = _get_user_contest_count(canonical)
+    # Fetch real live data from GraphQL to bypass Trap 1 & Trap 3 completely
+    real_count, live_rating = _get_live_user_data(canonical)
+    
+    # If GraphQL found their live rating, it represents their true synchronized 
+    # value (inclusive of yesterdays Biweekly). Override the bulk fallback.
+    true_old_rating = live_rating if live_rating is not None else entry["old_rating"]
 
     result = predict(
-        old_rating=entry["old_rating"],
+        old_rating=true_old_rating,
         contest_count=real_count,
         actual_rank=int(entry["actual_rank"]),
         rating_counts=rating_counts,
