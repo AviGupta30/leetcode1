@@ -2,9 +2,9 @@ name: LeetCode Contest Sync
 
 on:
   schedule:
-    # This runs every Sunday at 10:30 AM UTC (adjust for contest end time)
+    # Runs every Sunday at 10:30 AM UTC
     - cron: '30 10 * * 0'
-  workflow_dispatch: # Allows you to run it manually with a button
+  workflow_dispatch: # Allows manual trigger via GitHub UI
 
 jobs:
   scrape_and_sync:
@@ -24,7 +24,6 @@ jobs:
 
       - name: Run ETL Script
         env:
-          # We store your secret keys in GitHub Settings, not the code!
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
         run: python cloud_etl.py
